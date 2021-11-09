@@ -45,27 +45,42 @@ int q_count = 0;
 int tail = 0; int head = 0;
 pthread_cond_t cond;
 pthread_mutex_t queue_mutex;
+pthread_mutex_t event_mutex;
+pthread_mutex_t pool_mutex;
 int pool_count = 0;
 
 void* signal_thread(void* args){
   while(1){
     pthread_mutex_lock(&queue_mutex);
+    pthread_mutex_lock(&pool_mutex);
     if(q_count > 0 && pool_count > 0){
       pool_count -=1;
       q_count -= 1;
+      pthread_mutex_unlock(&pool_mutex);
+      pthread_mutex_unlock(&queue_mutex);
       pthread_cond_signal(&cond);
+    }else{
+      pthread_mutex_unlock(&pool_mutex);
+      pthread_mutex_unlock(&queue_mutex);
     }
-    pthread_mutex_unlock(&queue_mutex);
+    
   }
 }
 
 
 void* pool_thread(void* args){
   while(1){
+    /*
     pthread_mutex_lock(&queue_mutex);
     pool_count++;
     pthread_cond_wait(&cond, &queue_mutex);
     pthread_mutex_unlock(&queue_mutex);
+    */
+
+    pthread_mutex_lock(&pool_mutex);
+    pool_count++;
+    pthread_cond_wait(&cond, &pool_mutex);
+    pthread_mutex_unlock(&pool_mutex);
 
     //read data
     pthread_mutex_lock(&queue_mutex);
@@ -85,7 +100,7 @@ void* pool_thread(void* args){
         break;
       }
     }
-    usleep(1000000);
+    usleep(5000000);
     // write ret.
     //pthread_mutex_lock(&queue_mutex);
     *ret = tmp_ret;
@@ -149,7 +164,9 @@ void* scan_socket(void* arg)
   {
 start:
     //Check client quit event
+    pthread_mutex_lock(&event_mutex);
     quit_wait = epoll_wait(epoll_fd_quit, events, 100,10);
+    pthread_mutex_unlock(&event_mutex);
     for(int i=0;i<quit_wait;i++)
     {
 quit:
@@ -164,7 +181,9 @@ quit:
       CHECK (close (events[i].data.fd));
     }
     //Check client send buffer
+    pthread_mutex_lock(&event_mutex);
     read_wait = epoll_wait(epoll_fd_read, events, 100,10);
+    pthread_mutex_unlock(&event_mutex);
     for(int i=0;i<read_wait;i++)
     {
       if(events[i].data.fd == main_fd)  goto start;
@@ -189,17 +208,18 @@ quit:
       ret = (int*)malloc(sizeof(int)*num_cnt);
       temp_num = (int*)malloc(sizeof(int)*num_cnt);
         
-      pthread_mutex_lock(&queue_mutex);
       for(int j=0;j<num_cnt;j++)
       {
+        pthread_mutex_lock(&queue_mutex);
         ret[j] = -1;
         temp_num[j] = atoi(strtok(NULL, " "));
-        q[que_idx+j].number = temp_num[j];
-        q[que_idx+j].ret=&ret[j];
-      }
-      que_idx+=num_cnt;
-      q_count+=num_cnt;
-      pthread_mutex_unlock(&queue_mutex);
+        q[que_idx].number = temp_num[j];
+        q[que_idx].ret=&ret[j];
+        que_idx = (que_idx + 1)%Q_LEN;
+        q_count = q_count + 1;
+        pthread_mutex_unlock(&queue_mutex);
+      }     
+      
 
       //Wait until whole number calculated
       printf("number of results : %d\n\n", num_cnt);
@@ -216,6 +236,7 @@ quit:
       }
 print:  ;
       //After calculation
+      printf("Wait end\n");
       char *is_prime;
       for(int i=0;i<num_cnt;i++)
       {
@@ -246,15 +267,21 @@ main (int argc, char *argv[]) {
   int connfd, listenfd;
   socklen_t clilen;
   struct sockaddr_in cliaddr;
-  int thread_cnt=4, c;
+  int thread_cnt=4, c, accept_cnt=1;
 
-  pthread_t sig_thread, event_thread;
-  
-  while((c = getopt(argc, argv, "n:")) != -1){
+  pthread_t sig_thread;
+
+  connection_t conn;
+  connection_init (&conn);
+
+  while((c = getopt(argc, argv, "n:a:")) != -1){
     switch(c)
     {
       case 'n':
         thread_cnt = atoi(optarg);
+        break;
+      case 'a':
+        accept_cnt = atoi(optarg);
         break;
       case '?':
         printf("Thread option error\n");
@@ -264,10 +291,14 @@ main (int argc, char *argv[]) {
   } 
   pthread_mutex_init(&cnt_mtx, NULL);
   pthread_mutex_init(&queue_mutex, NULL);
+  pthread_mutex_init(&event_mutex, NULL);
+  pthread_mutex_init(&pool_mutex, NULL);
 
   printf("Thread pool size : %d\n", thread_cnt);
 
   pthread_t worker_thread[thread_cnt];
+  pthread_t accept_thread[accept_cnt];
+
   for(int i=0;i<thread_cnt;i++)
   {
     pthread_create(&worker_thread[i], NULL, pool_thread, NULL);
@@ -297,17 +328,35 @@ main (int argc, char *argv[]) {
   //add server event
   epoll_ctl(epoll_fd_read, EPOLL_CTL_ADD, listenfd, &read_ev);
   epoll_ctl(epoll_fd_quit, EPOLL_CTL_ADD, listenfd, &quit_ev);
-
-  pthread_create(&event_thread, NULL, scan_socket, NULL);
+  printf("Number of accept thread : %d\n", accept_cnt);
+  for(int i=0;i<accept_cnt;i++)
+  {
+    pthread_create(&accept_thread[i], NULL, scan_socket, NULL);  
+  }
 
   while (! shutting_down) {
-    printf("Waiting for next connections....\n\n");
     errno = 0;
     clilen = sizeof (cliaddr); /* length of address can vary, by protocol */
+    printf("Waiting for next connections....\n\n");
+
     if ((connfd = accept (listenfd, (struct sockaddr *) &cliaddr, &clilen)) < 0) {
       if (errno != EINTR) ERR_QUIT ("accept"); 
       /* otherwise try again, unless we are shutting down */
     } else {
+      pthread_mutex_lock(&pool_mutex);
+      if(!pool_count) {
+        printf("pool %d\n", pool_count);
+        pthread_mutex_unlock(&pool_mutex);
+        conn.sockfd = connfd;
+        char* sorry = "Sorry Server is busy\n\0";
+        writen (&conn, sorry, strlen(sorry));
+        printf("%d refused\n", connfd);
+        close(connfd);
+        continue;
+      }else{
+        pthread_mutex_unlock(&pool_mutex);
+      }
+
       printf("socker number %d Connected\n", connfd);
       pthread_mutex_lock(&cnt_mtx);
       client_cnt++;
